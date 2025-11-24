@@ -9,10 +9,10 @@ import org.springframework.data.jpa.repository.Query;
 import java.util.Optional;
 import java.util.UUID;
 
-public interface UserRepository extends JpaRepository<User, UUID> {
+public interface UserRepository extends JpaRepository<User, UUID>, UserRepositoryCustom {
     @Query(
-            value = "SELECT DISTINCT u FROM User u LEFT JOIN FETCH u.roles ",
-            countQuery = "SELECT COUNT(u) FROM User u"
+            value = "SELECT DISTINCT u FROM User u LEFT JOIN FETCH u.roles",
+            countQuery = "SELECT COUNT(DISTINCT u) FROM User u"
     )
     Page<User> findAllWithRoles(Pageable pageable);
     Optional<User> findByUsername(String username);
