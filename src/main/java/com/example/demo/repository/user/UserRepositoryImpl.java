@@ -6,16 +6,15 @@ import com.example.demo.entity.QRole;
 import com.example.demo.entity.QUser;
 import com.querydsl.core.BooleanBuilder;
 import com.querydsl.core.Tuple;
+import com.querydsl.core.types.Expression;
 import com.querydsl.core.types.OrderSpecifier;
 import com.querydsl.core.types.Projections;
+import com.querydsl.core.types.dsl.BooleanExpression;
 import com.querydsl.core.types.dsl.ComparableExpressionBase;
 import com.querydsl.jpa.impl.JPAQuery;
 import com.querydsl.jpa.impl.JPAQueryFactory;
 import lombok.RequiredArgsConstructor;
-import org.springframework.data.domain.Page;
-import org.springframework.data.domain.PageImpl;
-import org.springframework.data.domain.Pageable;
-import org.springframework.data.domain.Sort;
+import org.springframework.data.domain.*;
 
 import java.util.*;
 import java.util.stream.Collectors;
@@ -25,114 +24,147 @@ public class UserRepositoryImpl implements UserRepositoryCustom {
 
     private final JPAQueryFactory queryFactory;
 
-    // 將 Q 實體聲明為成員變數，方便所有方法使用
-    private final QUser u = QUser.user;
-    private final QRole r = QRole.role;
+    // 將 Q 實體聲明為靜態，提高可讀性
+    private static final QUser u = QUser.user;
+    private static final QRole r = QRole.role;
 
-    // ⭐ 排序屬性映射表：將 DTO/Pageable 屬性名映射到 QueryDSL 的 Q-Entity 屬性
+    /** 排序屬性映射 */
     private static final Map<String, ComparableExpressionBase<?>> SORT_PROPERTIES = Map.of(
-            "id", QUser.user.id,
-            "username", QUser.user.username,
-            "email", QUser.user.email,
-            "displayName", QUser.user.displayName,
-            "isActive", QUser.user.isActive,
-            "createdAt", QUser.user.createdAt,
-            "updatedAt", QUser.user.updatedAt
+            "id", u.id,
+            "username", u.username,
+            "email", u.email,
+            "displayName", u.displayName,
+            "isActive", u.isActive,
+            "createdAt", u.createdAt,
+            "updatedAt", u.updatedAt
     );
 
-    // 預設排序 (如果 Pageable 中沒有指定)
+    /** 預設排序 */
     private static final Sort.Order DEFAULT_ORDER = Sort.Order.asc("username");
 
 
     @Override
     public Page<UserDto> searchUsers(UserSearchCriteria criteria, Pageable pageable) {
 
-        // 判斷是否需要 JOIN roles 表進行過濾
-        boolean needsRoleJoin = criteria.getRoleName() != null && !criteria.getRoleName().isBlank();
+        boolean filterRoles = hasText(criteria.getRoleName());
+        BooleanBuilder userPredicate = buildUserPredicate(criteria);
 
-        // ===== 第一階段：查詢符合條件的 User ID =====
-        JPAQuery<UUID> idsQuery = queryFactory
-                .select(u.id)
-                .from(u);
+        // ----------------------------------------------------------------------
+        //             1. Count Query（獲取總數）
+        // ----------------------------------------------------------------------
+        JPAQuery<Long> countQuery = queryFactory
+                .select(filterRoles ? u.id.countDistinct() : u.count())
+                .from(u)
+                .where(userPredicate);
 
-        // 只有在需要角色過濾時才 JOIN 聯結表
-        if (needsRoleJoin) {
-            // 注意：這裡只 JOIN 聯結表 r，不是 fetchJoin
-            idsQuery = idsQuery.leftJoin(u.roles, r);
+        if (filterRoles) {
+            countQuery.leftJoin(u.roles, r)
+                    .where(roleEquals(criteria.getRoleName()));
         }
 
-        // 套用搜尋條件
-        idsQuery = idsQuery.where(buildPredicate(criteria));
-
-        // 如果有 JOIN 角色表進行過濾，必須使用 DISTINCT 去重
-        if (needsRoleJoin) {
-            idsQuery = idsQuery.distinct();
+        long total = Optional.ofNullable(countQuery.fetchOne()).orElse(0L);
+        if (total == 0) {
+            return Page.empty(pageable);
         }
 
-        // 套用優化後的排序邏輯
-        idsQuery = applySorting(idsQuery, pageable);
+        // ----------------------------------------------------------------------
+        //             2. 查詢分頁後的 User ID
+        // ----------------------------------------------------------------------
 
-        // 獲取總數（在分頁前）
-        long total = idsQuery.fetchCount();
+        // A. 構建 SELECT 欄位列表：必須包含 u.id 和所有排序欄位
+        List<Expression<?>> selectColumns = new ArrayList<>();
+        selectColumns.add(u.id);
 
-        // 獲取當前頁的 ID 列表
-        List<UUID> userIds = idsQuery
+        List<Sort.Order> orders = pageable.getSort().isSorted()
+                ? pageable.getSort().toList()
+                : List.of(DEFAULT_ORDER);
+
+        // 將所有排序欄位加入 SELECT 列表
+        for (Sort.Order order : orders) {
+            ComparableExpressionBase<?> expr = SORT_PROPERTIES.get(order.getProperty());
+            // 避免重複加入
+            if (expr != null && !selectColumns.contains(expr)) {
+                selectColumns.add(expr);
+            }
+        }
+
+        // 確保預設排序欄位也被選取
+        ComparableExpressionBase<?> defaultExpr = SORT_PROPERTIES.get(DEFAULT_ORDER.getProperty());
+        if (defaultExpr != null && !selectColumns.contains(defaultExpr)) {
+            selectColumns.add(defaultExpr);
+        }
+
+        // B. 構建 ID 查詢 (使用 Tuple 來選取多個欄位)
+        JPAQuery<Tuple> idsQuery = queryFactory
+                .select(selectColumns.toArray(new Expression[0]))
+                .from(u)
+                .where(userPredicate);
+
+        // C. 套用 JOIN、過濾和 DISTINCT
+        if (filterRoles) {
+            idsQuery.leftJoin(u.roles, r)
+                    .where(roleEquals(criteria.getRoleName()))
+                    .distinct(); // 啟用 DISTINCT
+        }
+
+        // D. 套用排序
+        applySorting(idsQuery, pageable);
+
+        // E. 執行查詢並從 Tuple 中提取 ID
+        List<Tuple> idTuples = idsQuery
                 .offset(pageable.getOffset())
                 .limit(pageable.getPageSize())
                 .fetch();
 
-        // 如果沒有結果，直接返回空頁
+        List<UUID> userIds = idTuples.stream()
+                .map(tuple -> tuple.get(u.id)) // 從 Tuple 中提取 u.id
+                .filter(Objects::nonNull)
+                .collect(Collectors.toList());
+
         if (userIds.isEmpty()) {
-            return new PageImpl<>(Collections.emptyList(), pageable, total);
+            return Page.empty(pageable);
         }
 
-        // ===== 第二階段：批次查詢 User 基礎資料 (⭐ DTO 投影) =====
+        // ----------------------------------------------------------------------
+        //             3. 批次查詢 User 基本資料（DTO）
+        // ----------------------------------------------------------------------
         List<UserDto> userDtos = queryFactory
-                .select(
-                        // Projections.constructor 實現 DTO 投影，只選取需要的欄位
-                        Projections.constructor(UserDto.class,
-                                u.id,
-                                u.username,
-                                u.email,
-                                u.displayName,
-                                u.isActive
-                        )
-                )
+                .select(Projections.constructor(UserDto.class,
+                        u.id,
+                        u.username,
+                        u.email,
+                        u.displayName,
+                        u.isActive
+                ))
                 .from(u)
                 .where(u.id.in(userIds))
                 .fetch();
 
-        // 將 List 轉換為 Map，以便按順序組裝
+        // 預先初始化 roles 列表
         Map<UUID, UserDto> userMap = userDtos.stream()
+                .peek(dto -> dto.setRoles(new ArrayList<>()))
                 .collect(Collectors.toMap(UserDto::getId, dto -> dto));
 
-
-        // ===== 第三階段：批次查詢 Roles 資料 (處理多對多關係) =====
-        // 專門查詢這些 User ID 擁有的所有角色名稱
+        // ----------------------------------------------------------------------
+        //             4. 批次查詢所有角色並聚合進 DTO
+        // ----------------------------------------------------------------------
         List<Tuple> roleTuples = queryFactory
                 .select(u.id, r.name)
                 .from(u)
-                .leftJoin(u.roles, r) // 執行 JOIN 抓取角色數據
+                .leftJoin(u.roles, r)
                 .where(u.id.in(userIds))
-                .orderBy(u.id.asc(), r.name.asc()) // 確保角色名稱有排序
+                .orderBy(u.id.asc(), r.name.asc())
                 .fetch();
 
-        // 聚合 Roles 數據到 DTO Map 中
-        for (Tuple tuple : roleTuples) {
-            UUID userId = tuple.get(u.id);
-            String roleName = tuple.get(r.name);
-
-            UserDto dto = userMap.get(userId);
-            if (dto != null && roleName != null) {
-                // 如果 DTO 的 roles 列表尚未初始化，這裡進行初始化並添加
-                if (dto.getRoles() == null) {
-                    dto.setRoles(new ArrayList<>());
-                }
-                dto.getRoles().add(roleName);
+        roleTuples.forEach(t -> {
+            UUID userId = t.get(u.id);
+            String roleName = t.get(r.name);
+            if (roleName != null) {
+                userMap.get(userId).getRoles().add(roleName);
             }
-        }
+        });
 
-        // 根據原始 ID 順序重新排列結果，以保證分頁順序準確
+        // 確保依照分頁的 ID 順序回傳
         List<UserDto> results = userIds.stream()
                 .map(userMap::get)
                 .filter(Objects::nonNull)
@@ -141,60 +173,70 @@ public class UserRepositoryImpl implements UserRepositoryCustom {
         return new PageImpl<>(results, pageable, total);
     }
 
+
+    // ---------------------------------------------------------
+    //                       Predicate 區塊
+    // ---------------------------------------------------------
+
     /**
-     * 構建查詢條件
+     * 構建 User 實體自身的查詢條件 (不包含關聯表格條件)
      */
-    private BooleanBuilder buildPredicate(UserSearchCriteria criteria) {
+    private BooleanBuilder buildUserPredicate(UserSearchCriteria c) {
         BooleanBuilder builder = new BooleanBuilder();
 
-        // 關鍵字搜尋
-        if (criteria.getKeyword() != null && !criteria.getKeyword().isBlank()) {
-            String keyword = criteria.getKeyword().trim();
+        if (hasText(c.getKeyword())) {
+            String k = c.getKeyword().trim();
             builder.and(
-                    u.username.containsIgnoreCase(keyword)
-                            .or(u.email.containsIgnoreCase(keyword))
-                            .or(u.displayName.containsIgnoreCase(keyword))
+                    u.username.containsIgnoreCase(k)
+                            .or(u.email.containsIgnoreCase(k))
+                            .or(u.displayName.containsIgnoreCase(k))
             );
         }
 
-        // 啟用狀態過濾
-        if (criteria.getIsActive() != null) {
-            builder.and(u.isActive.eq(criteria.getIsActive()));
-        }
-
-        // 角色名稱過濾 (在第一階段 JOIN r 時使用)
-        if (criteria.getRoleName() != null && !criteria.getRoleName().isBlank()) {
-            builder.and(r.name.equalsIgnoreCase(criteria.getRoleName().trim()));
+        if (c.getIsActive() != null) {
+            builder.and(u.isActive.eq(c.getIsActive()));
         }
 
         return builder;
     }
 
     /**
-     * 優化後的套用排序：更通用且簡潔的 QueryDSL 排序
+     * 構建 Role 實體自身的查詢條件
      */
-    private <T> JPAQuery<T> applySorting(JPAQuery<T> query, Pageable pageable) {
+    private BooleanExpression roleEquals(String roleName) {
+        return hasText(roleName) ? r.name.equalsIgnoreCase(roleName.trim()) : null;
+    }
+
+    private boolean hasText(String s) {
+        return s != null && !s.isBlank();
+    }
+
+
+    // ---------------------------------------------------------
+    //                       排序邏輯
+    // ---------------------------------------------------------
+
+    /**
+     * 套用排序邏輯，適用於 JPAQuery<T> 或 JPAQuery<Tuple>
+     */
+    private <T> void applySorting(JPAQuery<T> query, Pageable pageable) {
         List<Sort.Order> orders = pageable.getSort().isSorted()
                 ? pageable.getSort().toList()
                 : List.of(DEFAULT_ORDER);
 
-        // 轉換 Spring Data Sort.Order 到 QueryDSL OrderSpecifier
-        List<OrderSpecifier<?>> orderSpecifiers = orders.stream()
-                .map(order -> {
-                    // 根據屬性名稱查找對應的 QueryDSL 欄位表達式
-                    ComparableExpressionBase<?> property = SORT_PROPERTIES.getOrDefault(
-                            order.getProperty(),
-                            // 如果屬性不存在，使用預設排序屬性
-                            SORT_PROPERTIES.get(DEFAULT_ORDER.getProperty())
-                    );
+        orders.stream()
+                .map(this::convertToOrderSpecifier)
+                .forEach(query::orderBy);
+    }
 
-                    return order.isAscending()
-                            ? property.asc()
-                            : property.desc();
-                })
-                .toList();
+    /**
+     * 將 Spring Data Sort.Order 轉換為 QueryDSL OrderSpecifier
+     */
+    private OrderSpecifier<?> convertToOrderSpecifier(Sort.Order order) {
+        ComparableExpressionBase<?> property =
+                SORT_PROPERTIES.getOrDefault(order.getProperty(),
+                        SORT_PROPERTIES.get(DEFAULT_ORDER.getProperty()));
 
-        // 套用所有 OrderSpecifiers
-        return query.orderBy(orderSpecifiers.toArray(new OrderSpecifier[0]));
+        return order.isAscending() ? property.asc() : property.desc();
     }
 }

@@ -7,6 +7,7 @@ import com.example.demo.entity.Role;
 import com.example.demo.entity.User;
 import com.example.demo.repository.RoleRepository;
 import com.example.demo.repository.user.UserRepository;
+import com.example.demo.util.UserMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -28,7 +29,7 @@ public class UserService {
      */
     public Page<UserDto> getUsers(Pageable pageable) {
         return userRepository.findAllWithRoles(pageable)
-                .map(this::mapToDto);
+                .map(UserMapper::mapToDto);
     }
 
     /**
@@ -43,7 +44,7 @@ public class UserService {
      */
     public UserDto getUserById(UUID id) {
         return userRepository.findById(id)
-                .map(this::mapToDto)
+                .map(UserMapper::mapToDto)
                 .orElseThrow(() -> new RuntimeException("User not found!"));
     }
 
@@ -65,7 +66,7 @@ public class UserService {
         }
 
         userRepository.save(user);
-        return mapToDto(user);
+        return UserMapper.mapToDto(user);
     }
 
     /**
@@ -77,19 +78,5 @@ public class UserService {
             throw new RuntimeException("User not found!");
         }
         userRepository.deleteById(id);
-    }
-
-    /**
-     * Entity 轉 DTO
-     */
-    private UserDto mapToDto(User user) {
-        return UserDto.builder()
-                .id(user.getId())
-                .username(user.getUsername())
-                .email(user.getEmail())
-                .displayName(user.getDisplayName())
-                .isActive(user.getIsActive())
-                .roles(user.getRoles().stream().map(Role::getName).toList())
-                .build();
     }
 }
