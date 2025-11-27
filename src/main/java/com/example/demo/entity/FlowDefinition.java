@@ -20,7 +20,7 @@ import java.util.UUID;
 @Table(name = "FlowDefinitions")
 public class FlowDefinition {
     @Id
-    @ColumnDefault("newid()")
+    @GeneratedValue(strategy = GenerationType.UUID)
     @Column(name = "Id", nullable = false)
     private UUID id;
 
